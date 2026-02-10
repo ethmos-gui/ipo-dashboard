@@ -43,6 +43,19 @@ const fmt = (n, d = 0) => n != null && !isNaN(n) ? Number(n).toLocaleString("pt-
 const fmtR = (n) => n != null && !isNaN(n) ? "R$ " + fmt(n, 2) : "–";
 const r1 = (n) => Math.round(n * 10) / 10;
 
+// ─── PRICE TIERS (auto-detected) ─────────────────────
+const PRICE_TIERS = [
+  { id: "economica", label: "Econômica", maxNormalDisc: 15, maxPromoDisc: 20, color: "#0891B2", bg: "#ECFEFF" },
+  { id: "intermediaria", label: "Intermediária", maxNormalDisc: 40, maxPromoDisc: 45, color: "#7C3AED", bg: "#F5F3FF" },
+  { id: "premium", label: "Premium", maxNormalDisc: 58, maxPromoDisc: 65, color: "#B45309", bg: "#FFFBEB" },
+];
+
+function detectPriceTier(discPct) {
+  if (discPct <= 15) return PRICE_TIERS[0]; // econômica
+  if (discPct <= 40) return PRICE_TIERS[1]; // intermediária
+  return PRICE_TIERS[2]; // premium
+}
+
 // ─── IPO ENGINE ──────────────────────────────────────
 function calcIPO(item, totalRev) {
   const cMg = (Math.max(0, Math.min(100, item.margin || 0)) / 100) * 20;
@@ -50,7 +63,25 @@ function calcIPO(item, totalRev) {
   if (item.qtyP1 > 0 && item.qtyP2 != null) {
     cTd = Math.max(0, Math.min(20, ((((item.qtyP2 - item.qtyP1) / item.qtyP1) * 100 + 50) / 100) * 20));
   }
-  const cPr = Math.max(0, Math.min(20, (item.listPrice > 0 ? item.avgPrice / item.listPrice : 0.5) * 20));
+
+  // Tier-aware price scoring
+  let cPr = 10;
+  if (item.listPrice > 0 && item.avgPrice > 0) {
+    const discPct = (1 - item.avgPrice / item.listPrice) * 100;
+    const tier = detectPriceTier(discPct);
+    const normalCeil = tier.maxNormalDisc;
+    const promoFloor = tier.maxPromoDisc;
+    if (discPct <= normalCeil) {
+      cPr = 20; // within healthy range
+    } else if (discPct >= promoFloor) {
+      cPr = 0; // at or beyond promo floor
+    } else {
+      cPr = r1(20 * (1 - (discPct - normalCeil) / (promoFloor - normalCeil)));
+    }
+    item._priceTier = tier;
+    item._discPct = r1(discPct);
+  }
+
   const cCt = Math.min(20, Math.log(1 + (totalRev > 0 ? (item.revenue / totalRev) * 100 : 0)) * 7);
   let cGi = 10;
   if (item.mesesEst != null) {
@@ -91,25 +122,30 @@ function findCol(headers, patterns) {
 }
 
 function toNum(v) {
-  const s = String(v || "0").trim();
-  if (!s || s === "-") return 0;
+  let s = String(v || "0").trim();
+  if (!s || s === "-" || s === "*") return 0;
+  // Remove currency symbols and spaces
+  s = s.replace(/[R$\s]/g, "");
   const hasDot = s.includes("."), hasCom = s.includes(",");
   if (hasDot && hasCom) {
-    // Both: last one is decimal separator
-    const li = Math.max(s.lastIndexOf("."), s.lastIndexOf(","));
-    const sep = s[li];
-    if (sep === ",") return Number(s.replace(/\./g, "").replace(",", ".")) || 0;
-    return Number(s.replace(/,/g, "").replace(".", ".")) || 0;
-  }
-  if (hasCom && !hasDot) return Number(s.replace(",", ".")) || 0;
-  // Only dots or no separator: check if it looks like Brazilian thousands (e.g. "1.000")
-  if (hasDot) {
-    const parts = s.split(".");
-    // "140.3708" → English decimal; "1.000" → Brazilian thousands
-    if (parts.length === 2 && parts[1].length === 3 && parts[0].length <= 3) {
-      return Number(s.replace(/\./g, "")) || 0; // Brazilian thousands
+    // Both present: last one is the decimal separator
+    if (s.lastIndexOf(",") > s.lastIndexOf(".")) {
+      // Brazilian: 2.236,000 → 2236.000
+      return Number(s.replace(/\./g, "").replace(",", ".")) || 0;
     }
-    return Number(s) || 0; // English decimal
+    // English: 1,234.56 → 1234.56
+    return Number(s.replace(/,/g, "")) || 0;
+  }
+  if (hasCom && !hasDot) {
+    // Only comma: could be "1,5" (decimal) or "1,000" (thousands)
+    // If exactly 3 digits after comma → ambiguous, but treat as decimal (1.000 = 1)
+    // For Brazilian thousands like "1,000" user would also have dots
+    return Number(s.replace(",", ".")) || 0;
+  }
+  if (hasDot && !hasCom) {
+    // Only dot: ALWAYS treat as English decimal
+    // "31.217333" → 31.217, "69.9" → 69.9, "1.000" → 1 (acceptable edge case)
+    return Number(s) || 0;
   }
   return Number(s) || 0;
 }
@@ -168,9 +204,9 @@ function parseSales(rows) {
     let ean = cEAN ? String(row[cEAN] || "").trim() : "";
     const isbn = extractISBN(ean) || extractISBN(code) || scanRowForISBN(row, h);
 
-    if (!map[code]) map[code] = { code, desc: String(row[cD] || ""), qty: 0, revenue: 0, _ps: 0, _ls: 0, _cs: 0, n: 0, ean, isbn: isbn || "", monthly: {} };
+    if (!map[code]) map[code] = { code, desc: String(row[cD] || ""), qty: 0, revenue: 0, _pw: 0, _lw: 0, _cw: 0, n: 0, ean, isbn: isbn || "", monthly: {} };
     map[code].qty += qty; map[code].revenue += rev;
-    map[code]._ps += price; map[code]._ls += list; map[code]._cs += cost; map[code].n += 1;
+    map[code]._pw += price * qty; map[code]._lw += list * qty; map[code]._cw += cost * qty; map[code].n += 1;
     if (!map[code].isbn && isbn) map[code].isbn = isbn;
     if (!map[code].ean && ean) map[code].ean = ean;
 
@@ -196,8 +232,8 @@ function parseSales(rows) {
 
     return {
       code: it.code, desc: it.desc, qty: it.qty, revenue: it.revenue, ean: it.ean || "", isbn: it.isbn || "",
-      avgPrice: it._ps / (it.n || 1), listPrice: it._ls / (it.n || 1), cost: it._cs / (it.n || 1),
-      margin: it._ps > 0 ? ((it._ps / it.n - it._cs / it.n) / (it._ps / it.n)) * 100 : 0,
+      avgPrice: it.qty > 0 ? it._pw / it.qty : 0, listPrice: it.qty > 0 ? it._lw / it.qty : 0, cost: it.qty > 0 ? it._cw / it.qty : 0,
+      margin: it._pw > 0 ? ((it._pw - it._cw) / it._pw) * 100 : 0,
       vdaMes: it.qty / nMonths,
       series,
       qtyP1: avgP1,
@@ -209,48 +245,23 @@ function parseSales(rows) {
 }
 
 function parseStock(rows) {
-  if (!rows.length) return { byCode: {}, isbnMap: {} };
+  if (!rows.length) return { byCode: {} };
   const h = Object.keys(rows[0]);
-  const cC = findCol(h, ["codigo", "code", "item", "sku", "texto de pesquisa"]) || h[0];
-  const cQ = findCol(h, ["disponivel", "estoque", "stock", "quantidade", "saldo"]);
-  const cD = findCol(h, ["descri", "produto"]);
-  // ISBN/EAN — expanded patterns for SBB Oracle exports
-  const cEAN = findCol(h, [
-    "ean", "isbn", "ean13", "isbn13", "gtin", "barcode", "cod barras",
-    "3 n", "n de item", "no de item", "no item", "num item",
-  ]);
+  const cC = findCol(h, ["n item", "codigo", "code", "item", "sku"]) || h[0];
+  const cQ = findCol(h, ["quantidade disponivel", "disponivel", "estoque", "stock", "saldo"]);
+  const cD = findCol(h, ["descricao", "descri", "produto"]);
   const map = {};
-  const isbnMap = {}; // reverse lookup: ANY code found in a row → its ISBN13
   for (const row of rows) {
     const code = String(row[cC] || "").trim();
     if (!code) continue;
-    let ean = cEAN ? String(row[cEAN] || "").trim() : "";
-    const isbn = extractISBN(ean) || extractISBN(code) || scanRowForISBN(row, h);
-    map[code] = {
-      estoque: toNum(row[cQ]),
-      descStock: cD ? String(row[cD] || "") : "",
-      ean: ean,
-      isbn: isbn || "",
-    };
-    // Build reverse ISBN lookup: index this ISBN by EVERY numeric identifier in the row
-    if (isbn) {
-      isbnMap[code] = isbn;
-      if (ean) isbnMap[ean.replace(/\D/g, "")] = isbn;
-      for (const col of h) {
-        const val = String(row[col] || "").trim();
-        const digits = val.replace(/\D/g, "");
-        // Index any 7-14 digit number (covers EAN8, EAN13, GTIN14, SBB internal codes)
-        if (digits.length >= 7 && digits.length <= 14 && digits !== isbn) {
-          isbnMap[digits] = isbn;
-        }
-        // Also index the raw trimmed value for non-numeric codes like "NA06BEX001"
-        if (val.length >= 4 && val.length <= 20) {
-          isbnMap[val] = isbn;
-        }
-      }
-    }
+    const qty = toNum(row[cQ]);
+    const desc = cD ? String(row[cD] || "") : "";
+    // Aggregate stock by code (sum quantities if multiple rows per product)
+    if (!map[code]) map[code] = { estoque: 0, descStock: desc };
+    map[code].estoque += qty;
+    if (!map[code].descStock && desc) map[code].descStock = desc;
   }
-  return { byCode: map, isbnMap };
+  return { byCode: map };
 }
 
 // ─── STORAGE ─────────────────────────────────────────
@@ -294,28 +305,55 @@ function Sparkline({ series, width = 80, height = 24, color = "#3B82F6" }) {
 }
 
 // ─── COVER IMAGE COMPONENT ──────────────────────────
+const coverCache = {};
+
 function Cover({ code, size = 36 }) {
-  const [status, setStatus] = useState("loading");
+  const [src, setSrc] = useState(null);
+  const [status, setStatus] = useState("idle");
+  const [visible, setVisible] = useState(false);
+  const ref = useRef(null);
   const url = coverUrl(code);
+
+  // Lazy load: only fetch when element is visible
+  useEffect(() => {
+    if (!ref.current || !url) return;
+    const obs = new IntersectionObserver(([e]) => { if (e.isIntersecting) { setVisible(true); obs.disconnect(); } }, { rootMargin: "100px" });
+    obs.observe(ref.current);
+    return () => obs.disconnect();
+  }, [url]);
+
+  useEffect(() => {
+    if (!visible || !url) return;
+    if (coverCache[code] === "err") { setStatus("err"); return; }
+    if (coverCache[code]) { setSrc(coverCache[code]); setStatus("ok"); return; }
+    setStatus("loading");
+
+    fetch(url, { referrerPolicy: "no-referrer", mode: "cors" })
+      .then(r => { if (!r.ok) throw new Error(r.status); return r.blob(); })
+      .then(blob => {
+        const blobUrl = URL.createObjectURL(blob);
+        coverCache[code] = blobUrl;
+        setSrc(blobUrl);
+        setStatus("ok");
+      })
+      .catch(() => {
+        // Fallback: try direct URL
+        coverCache[code] = url;
+        setSrc(url);
+        setStatus("direct");
+      });
+  }, [visible, url, code]);
 
   const box = { width: size, height: size * 1.4, borderRadius: 3, border: "1px solid #E2E8F0", flexShrink: 0 };
 
-  if (!url) return <div style={{ ...box, background: "#F1F5F9", display: "flex", alignItems: "center", justifyContent: "center", fontSize: size * 0.35, color: "#CBD5E1" }}>📖</div>;
+  if (!url) return <div ref={ref} style={{ ...box, background: "#F1F5F9", display: "flex", alignItems: "center", justifyContent: "center", fontSize: size * 0.35, color: "#CBD5E1" }}>📖</div>;
+  if (status === "err") return <div style={{ ...box, background: "#F1F5F9", display: "flex", alignItems: "center", justifyContent: "center", fontSize: size * 0.35, color: "#CBD5E1" }}>📖</div>;
+  if (!src) return <div ref={ref} style={{ ...box, background: "#F1F5F9", display: "flex", alignItems: "center", justifyContent: "center", fontSize: size * 0.25, color: "#CBD5E1" }}>⏳</div>;
   return (
-    <div style={{ ...box, position: "relative" }}>
-      {status === "loading" && (
-        <div style={{ position: "absolute", inset: 0, borderRadius: 3, background: "#F1F5F9", display: "flex", alignItems: "center", justifyContent: "center", fontSize: size * 0.25, color: "#CBD5E1" }}>⏳</div>
-      )}
-      {status !== "err" ? (
-        <img src={url} alt="" loading="lazy"
-          onLoad={() => setStatus("ok")}
-          onError={() => setStatus("err")}
-          style={{ ...box, objectFit: "cover", background: "#F8FAFC" }}
-        />
-      ) : (
-        <div style={{ ...box, background: "#F1F5F9", display: "flex", alignItems: "center", justifyContent: "center", fontSize: size * 0.35, color: "#CBD5E1" }}>📖</div>
-      )}
-    </div>
+    <img ref={ref} src={src} alt="" referrerPolicy="no-referrer"
+      onError={() => { coverCache[code] = "err"; setStatus("err"); }}
+      style={{ ...box, objectFit: "cover", background: "#F8FAFC" }}
+    />
   );
 }
 
@@ -333,6 +371,7 @@ export default function App() {
   const [sortDir, setSortDir] = useState("desc");
   const [fTier, setFTier] = useState("all");
   const [fBand, setFBand] = useState("all");
+  const [fPriceTier, setFPriceTier] = useState("all");
   const [search, setSearch] = useState("");
   const [sel, setSel] = useState(null);
   const [hist, setHist] = useState([]);
@@ -384,14 +423,14 @@ export default function App() {
     }
 
     const { items: sales, allMonths: months } = parseSales(filteredRows);
-    const { byCode: stock, isbnMap } = stockRaw ? parseStock(stockRaw) : { byCode: {}, isbnMap: {} };
+    const { byCode: stock } = stockRaw ? parseStock(stockRaw) : { byCode: {} };
     const totalRev = sales.reduce((s, i) => s + i.revenue, 0);
     const items = sales.map((item) => {
-      const si = stock[item.code];
+      // Direct match: Código (vendas) = Nº Item (estoque)
+      const si = stock[item.code] || null;
       const estoque = si?.estoque ?? null;
       const mesesEst = estoque != null && item.vdaMes > 0 ? estoque / item.vdaMes : estoque > 0 ? 999 : null;
-      const codeDigits = item.code.replace(/\D/g, "");
-      const isbn = item.isbn || si?.isbn || isbnMap[item.code] || isbnMap[codeDigits] || isbnMap[item.ean?.replace(/\D/g, "")] || extractISBN(item.code) || extractISBN(item.ean) || "";
+      const isbn = item.isbn || extractISBN(item.code) || extractISBN(item.ean) || "";
       const e = { ...item, estoque, mesesEst, descStock: si?.descStock || "", isbn };
       const ipo = calcIPO(e, totalRev);
       const tier = estoque != null ? getTier({ ...e, mesesEst }) : "saudavel";
@@ -409,16 +448,18 @@ export default function App() {
     const m = detectedMonths;
     const withISBN = results.filter(i => i.isbn).length;
     const withCover = results.filter(i => coverUrl(i.code)).length;
-    setDbg(`${m.length}/${totalMonths} meses (${mesAnoLabel(m[0])}→${mesAnoLabel(m[m.length-1])}) | ${withCover} com capa | ${results.length} produtos`);
+    const withStock = results.filter(i => i.estoque != null).length;
+    setDbg(`${m.length}/${totalMonths} meses (${mesAnoLabel(m[0])}→${mesAnoLabel(m[m.length-1])}) | ${withStock}/${results.length} com estoque | ${withCover} com capa`);
   }, [detectedMonths, results, totalMonths]);
 
   const filtered = useMemo(() => {
     let l = results;
     if (fTier !== "all") l = l.filter(r => r.tier === fTier);
     if (fBand !== "all") l = l.filter(r => r.band.label === fBand);
+    if (fPriceTier !== "all") l = l.filter(r => r._priceTier?.id === fPriceTier);
     if (search) { const t = search.toLowerCase(); l = l.filter(r => r.code.toLowerCase().includes(t) || r.desc.toLowerCase().includes(t) || (r.descStock || "").toLowerCase().includes(t) || (r.isbn || "").includes(t)); }
     return [...l].sort((a, b) => sortDir === "desc" ? (b[sortKey] ?? -1e9) - (a[sortKey] ?? -1e9) : (a[sortKey] ?? 1e9) - (b[sortKey] ?? 1e9));
-  }, [results, fTier, fBand, search, sortKey, sortDir]);
+  }, [results, fTier, fBand, fPriceTier, search, sortKey, sortDir]);
 
   const stats = useMemo(() => {
     if (!results.length) return null;
@@ -450,6 +491,7 @@ export default function App() {
     if (!filtered.length) return;
     const csv = Papa.unparse(filtered.map(r => ({
       Codigo: r.code, ISBN: r.isbn || "", EAN: r.ean || "", Descricao: r.descStock || r.desc, IPO: r.ipo, Faixa: r.band.label,
+      CategoriaPreco: r._priceTier?.label || "", DescontoPct: r._discPct ?? "",
       Tier: TIERS[r.tier]?.label || "", Margem: r1(r.margin), PrecoMedio: r1(r.avgPrice),
       PrecoLista: r1(r.listPrice), Custo: r1(r.cost), Quantidade: r.qty, Receita: Math.round(r.revenue),
       Estoque: r.estoque ?? "", MesesEstoque: r.mesesEst != null ? (r.mesesEst >= 900 ? "999" : Math.round(r.mesesEst)) : "",
@@ -611,6 +653,10 @@ export default function App() {
             <option value="all">Todas as faixas</option>
             {IPO_BANDS.map(b => <option key={b.label} value={b.label}>{b.label} (≥{b.min})</option>)}
           </select>
+          <select value={fPriceTier} onChange={e => setFPriceTier(e.target.value)} style={{ padding: "9px 12px", borderRadius: 8, fontSize: 13, background: "#FFF", border: "1px solid #E2E8F0", color: "#334155", cursor: "pointer" }}>
+            <option value="all">Todas as categorias</option>
+            {PRICE_TIERS.map(t => <option key={t.id} value={t.id}>{t.label} (até {t.maxNormalDisc}%)</option>)}
+          </select>
           <span style={{ fontSize: 12, color: "#94A3B8", fontWeight: 600 }}>{filtered.length} itens</span>
         </div>
 
@@ -653,6 +699,7 @@ export default function App() {
                       <td style={{ ...P.td, fontFamily: "'SF Mono','Cascadia Code',monospace", fontSize: 10.5, color: "#64748B", textAlign: "right" }}>{r.code}</td>
                       <td style={{ ...P.td, maxWidth: 220, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", textAlign: "left", color: "#334155" }}>
                         {r.descStock || r.desc || "–"}
+                        {r._priceTier && <span style={{ marginLeft: 6, fontSize: 9, padding: "1px 5px", borderRadius: 4, background: r._priceTier.bg, color: r._priceTier.color, fontWeight: 700 }}>{r._priceTier.label[0]}</span>}
                       </td>
                       <td style={{ ...P.td, textAlign: "center", padding: "4px 4px" }}>
                         <Sparkline series={r.series} width={80} height={22} />
@@ -715,28 +762,59 @@ export default function App() {
               </div>
 
               {/* Monthly performance sparkline */}
-              {sel.series && sel.series.length > 1 && (
-                <div style={{ background: "#F8FAFC", borderRadius: 10, padding: "12px 16px", marginBottom: 16, border: "1px solid #E2E8F0" }}>
-                  <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 8 }}>
-                    <span style={{ fontSize: 10, fontWeight: 700, color: "#94A3B8", textTransform: "uppercase", letterSpacing: 0.8 }}>Vendas mensais</span>
-                    <span style={{ fontSize: 10, color: sel.trend >= 0 ? "#16A34A" : "#DC2626", fontWeight: 700 }}>
-                      {sel.trend >= 0 ? "▲" : "▼"} {Math.abs(sel.trend).toFixed(1)}% tendência
-                    </span>
+              {sel.series && sel.series.length > 1 && (() => {
+                const W = 540, H = 100, PAD = { t: 4, b: 18, l: 36, r: 8 };
+                const cw = W - PAD.l - PAD.r, ch = H - PAD.t - PAD.b;
+                const max = Math.max(...sel.series, 1);
+                const barW = Math.max(2, (cw / sel.series.length) - 2);
+                const avgFirst = sel.series.slice(0, Math.ceil(sel.series.length / 2)).reduce((a, b) => a + b, 0) / Math.ceil(sel.series.length / 2);
+                const avgSecond = sel.series.slice(-Math.ceil(sel.series.length / 2)).reduce((a, b) => a + b, 0) / Math.ceil(sel.series.length / 2);
+                const trendColor = avgSecond >= avgFirst ? "#16A34A" : "#DC2626";
+                // Y-axis ticks
+                const ySteps = [0, Math.round(max / 2), Math.round(max)];
+                return (
+                  <div style={{ background: "#F8FAFC", borderRadius: 10, padding: "12px 16px", marginBottom: 16, border: "1px solid #E2E8F0" }}>
+                    <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 8 }}>
+                      <span style={{ fontSize: 10, fontWeight: 700, color: "#94A3B8", textTransform: "uppercase", letterSpacing: 0.8 }}>Vendas mensais</span>
+                      <span style={{ fontSize: 10, color: trendColor, fontWeight: 700 }}>
+                        {sel.trend >= 0 ? "▲" : "▼"} {Math.abs(sel.trend).toFixed(1)}% tendência
+                      </span>
+                    </div>
+                    <svg width={W} height={H} style={{ display: "block" }}>
+                      {/* Grid lines */}
+                      {ySteps.map(v => {
+                        const y = PAD.t + ch - (v / max) * ch;
+                        return <g key={v}>
+                          <line x1={PAD.l} x2={W - PAD.r} y1={y} y2={y} stroke="#E2E8F0" strokeWidth={0.5} strokeDasharray={v > 0 ? "3,3" : "0"} />
+                          <text x={PAD.l - 4} y={y + 3} textAnchor="end" fontSize={8} fill="#94A3B8">{v}</text>
+                        </g>;
+                      })}
+                      {/* Bars */}
+                      {sel.series.map((v, i) => {
+                        const x = PAD.l + (i / sel.series.length) * cw + 1;
+                        const barH = Math.max(1, (v / max) * ch);
+                        const y = PAD.t + ch - barH;
+                        const isZero = v === 0;
+                        return <rect key={i} x={x} y={isZero ? PAD.t + ch - 1 : y} width={barW} height={isZero ? 1 : barH}
+                          fill={isZero ? "#E2E8F0" : trendColor} opacity={isZero ? 0.5 : 0.7} rx={1} />;
+                      })}
+                      {/* Month labels */}
+                      {detectedMonths.map((m, i) => {
+                        const show = i % Math.max(1, Math.floor(detectedMonths.length / 10)) === 0 || i === detectedMonths.length - 1;
+                        if (!show) return null;
+                        const x = PAD.l + (i / sel.series.length) * cw + barW / 2;
+                        return <text key={m} x={x} y={H - 2} textAnchor="middle" fontSize={8} fill="#94A3B8">{mesAnoLabel(m)}</text>;
+                      })}
+                    </svg>
                   </div>
-                  <Sparkline series={sel.series} width={500} height={60} />
-                  <div style={{ display: "flex", justifyContent: "space-between", marginTop: 4 }}>
-                    {detectedMonths.filter((_, i) => i % Math.max(1, Math.floor(detectedMonths.length / 8)) === 0 || i === detectedMonths.length - 1).map(m => (
-                      <span key={m} style={{ fontSize: 8, color: "#94A3B8" }}>{mesAnoLabel(m)}</span>
-                    ))}
-                  </div>
-                </div>
-              )}
+                );
+              })()}
 
               <div style={{ display: "grid", gridTemplateColumns: "repeat(5, 1fr)", gap: 6, marginBottom: 16 }}>
                 {[
                   { l: "Margem", v: sel.cMg, c: "#7C3AED", bg: "#F5F3FF" },
                   { l: "Tendência", v: sel.cTd, c: "#2563EB", bg: "#EFF6FF" },
-                  { l: "Preço", v: sel.cPr, c: "#0891B2", bg: "#ECFEFF" },
+                  { l: "Preço", v: sel.cPr, c: "#0891B2", bg: "#ECFEFF", sub: sel._priceTier ? sel._priceTier.label : null },
                   { l: "Contribuição", v: sel.cCt, c: "#D97706", bg: "#FFFBEB" },
                   { l: "Giro", v: sel.cGi, c: "#059669", bg: "#ECFDF5" },
                 ].map(x => (
@@ -746,15 +824,33 @@ export default function App() {
                     <div style={{ height: 4, background: "#E2E8F0", borderRadius: 2, marginTop: 5, overflow: "hidden" }}>
                       <div style={{ height: "100%", width: (x.v / 20 * 100) + "%", background: x.c, borderRadius: 2, transition: "width 0.4s" }} />
                     </div>
-                    <div style={{ fontSize: 9, color: "#CBD5E1", marginTop: 2 }}>de 20</div>
+                    {x.sub ? (
+                      <div style={{ fontSize: 8, color: x.c, marginTop: 3, fontWeight: 700 }}>{x.sub}</div>
+                    ) : (
+                      <div style={{ fontSize: 9, color: "#CBD5E1", marginTop: 2 }}>de 20</div>
+                    )}
                   </div>
                 ))}
               </div>
+
+              {/* Price tier context */}
+              {sel._priceTier && (
+                <div style={{ display: "flex", gap: 8, alignItems: "center", marginBottom: 14, padding: "8px 12px", borderRadius: 8, background: sel._priceTier.bg, border: "1px solid #E2E8F0" }}>
+                  <span style={{ fontSize: 11, fontWeight: 700, color: sel._priceTier.color }}>{sel._priceTier.label}</span>
+                  <span style={{ fontSize: 11, color: "#64748B" }}>
+                    Desc. praticado: <b>{fmt(sel._discPct, 1)}%</b>
+                  </span>
+                  <span style={{ fontSize: 10, color: "#94A3B8" }}>
+                    (faixa normal: até {sel._priceTier.maxNormalDisc}% · promo: até {sel._priceTier.maxPromoDisc}%)
+                  </span>
+                </div>
+              )}
 
               <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(110px, 1fr))", gap: 6, marginBottom: 14 }}>
                 {[
                   ["Preço Médio", fmtR(sel.avgPrice)], ["Preço Lista", fmtR(sel.listPrice)],
                   ["Custo", fmtR(sel.cost)], ["Margem", fmt(sel.margin, 1) + "%"],
+                  ["Desconto", sel._discPct != null ? fmt(sel._discPct, 1) + "%" : "N/D"],
                   ["Estoque", sel.estoque != null ? fmt(sel.estoque) : "N/D"],
                   ["Meses Est.", sel.mesesEst == null ? "N/D" : sel.mesesEst >= 900 ? "∞" : fmt(sel.mesesEst)],
                 ].map(([l, v]) => (

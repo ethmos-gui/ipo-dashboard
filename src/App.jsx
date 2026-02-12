@@ -94,7 +94,7 @@ function parseCatalog(rows) {
 }
 
 // ─── IPO ENGINE ──────────────────────────────────────
-function calcIPO(item, totalRev, maxRevShare) {
+function calcIPO(item, totalRev, maxRevShare, totalQty, maxQtyShare) {
   const cMg = (Math.max(0, Math.min(100, item.margin || 0)) / 100) * 20;
   
   // Trend: protect launches (< 6 months since first sale) — give neutral 12/20
@@ -123,9 +123,12 @@ function calcIPO(item, totalRev, maxRevShare) {
     item._discPct = r1(discPct);
   }
 
-  // Contribution: normalized so top contributor = 20
+  // Contribution: 50% revenue share + 50% volume share, each normalized by top contributor
   const revShare = totalRev > 0 ? item.revenue / totalRev : 0;
-  const cCt = maxRevShare > 0 ? Math.min(20, (revShare / maxRevShare) * 20) : 0;
+  const qtyShare = totalQty > 0 ? item.qty / totalQty : 0;
+  const cCtRev = maxRevShare > 0 ? (revShare / maxRevShare) * 20 : 0;
+  const cCtQty = maxQtyShare > 0 ? (qtyShare / maxQtyShare) * 20 : 0;
+  const cCt = Math.min(20, cCtRev * 0.5 + cCtQty * 0.5);
   let cGi = 10;
   if (item.mesesEst != null) {
     cGi = item.mesesEst <= 3 ? 20 : item.mesesEst >= 24 ? 0 : 20 - ((item.mesesEst - 3) / 21) * 20;
@@ -348,7 +351,7 @@ function Sparkline({ series, width = 80, height = 24, color = "#3B82F6" }) {
 // ─── COVER IMAGE COMPONENT ──────────────────────────
 const coverCache = {};
 
-function Cover({ code, size = 36 }) {
+function Cover({ code, size = 36, retrySignal = 0 }) {
   const [src, setSrc] = useState(null);
   const [status, setStatus] = useState("idle");
   const [visible, setVisible] = useState(false);
@@ -365,8 +368,10 @@ function Cover({ code, size = 36 }) {
 
   useEffect(() => {
     if (!visible || !url) return;
-    if (coverCache[code] === "err") { setStatus("err"); return; }
-    if (coverCache[code]) { setSrc(coverCache[code]); setStatus("ok"); return; }
+    if (retrySignal === 0 && coverCache[code] === "err") { setStatus("err"); return; }
+    if (retrySignal === 0 && coverCache[code] && coverCache[code] !== "err") { setSrc(coverCache[code]); setStatus("ok"); return; }
+    // Clear cache on retry
+    if (retrySignal > 0) { delete coverCache[code]; }
     setStatus("loading");
 
     fetch(url, { referrerPolicy: "no-referrer", mode: "cors" })
@@ -378,12 +383,10 @@ function Cover({ code, size = 36 }) {
         setStatus("ok");
       })
       .catch(() => {
-        // Fallback: try direct URL
-        coverCache[code] = url;
-        setSrc(url);
-        setStatus("direct");
+        coverCache[code] = "err";
+        setStatus("err");
       });
-  }, [visible, url, code]);
+  }, [visible, url, code, retrySignal]);
 
   const box = { width: size, height: size * 1.4, borderRadius: 3, border: "1px solid #E2E8F0", flexShrink: 0 };
 
@@ -420,6 +423,16 @@ export default function App() {
   const [fStatus, setFStatus] = useState("all");
   const [search, setSearch] = useState("");
   const [sel, setSel] = useState(null);
+  const [coverRetry, setCoverRetry] = useState(0);
+
+  // Modal: ESC to close + lock body scroll
+  useEffect(() => {
+    if (!sel) return;
+    document.body.style.overflow = "hidden";
+    const onKey = e => { if (e.key === "Escape") setSel(null); };
+    window.addEventListener("keydown", onKey);
+    return () => { document.body.style.overflow = ""; window.removeEventListener("keydown", onKey); };
+  }, [sel]);
   const [hist, setHist] = useState([]);
   const [label, setLabel] = useState("");
   const [saved, setSaved] = useState("");
@@ -512,6 +525,8 @@ export default function App() {
     const now = new Date();
     const totalRev = sales.reduce((s, i) => s + i.revenue, 0);
     const maxRevShare = totalRev > 0 ? Math.max(...sales.map(i => i.revenue / totalRev)) : 0;
+    const totalQty = sales.reduce((s, i) => s + i.qty, 0);
+    const maxQtyShare = totalQty > 0 ? Math.max(...sales.map(i => i.qty / totalQty)) : 0;
     const items = sales.map((item) => {
       const si = stock[item.code] || null;
       const estoque = si?.estoque ?? null;
@@ -527,7 +542,7 @@ export default function App() {
       const mesesDesde = dtPrimeiraVenda ? Math.max(0, (now.getFullYear() - dtPrimeiraVenda.getFullYear()) * 12 + now.getMonth() - dtPrimeiraVenda.getMonth()) : null;
       const isLancamento = mesesDesde !== null && mesesDesde < 6;
       const e = { ...item, estoque, mesesEst, descStock: si?.descStock || "", isbn, familia, traducao, foraLinha, dtPrimeiraVenda, mesesDesde, isLancamento };
-      const ipo = calcIPO(e, totalRev, maxRevShare);
+      const ipo = calcIPO(e, totalRev, maxRevShare, totalQty, maxQtyShare);
       const tier = estoque != null ? getTier({ ...e, mesesEst }) : "saudavel";
       const pp = tier !== "saudavel" ? getPromoPrice(e, tier) : null;
       const pm = pp && pp > 0 ? ((pp - e.cost) / pp) * 100 : null;
@@ -571,16 +586,21 @@ export default function App() {
     const ws = results.filter(r => r.estoque != null);
     const tRev = results.reduce((s, r) => s + r.revenue, 0);
     const ti = { liquidacao: 0, agressiva: 0, moderada: 0, saudavel: 0 };
-    ws.forEach(r => { ti[r.tier]++; });
+    const tiVal = { liquidacao: 0, agressiva: 0, moderada: 0, saudavel: 0 };
+    ws.forEach(r => { ti[r.tier]++; tiVal[r.tier] += (r.estoque || 0) * (r.cost || 0); });
+    // IPO band distribution
+    const bands = {};
+    IPO_BANDS.forEach(b => { bands[b.label] = { count: 0, rev: 0, color: b.color, bg: b.bg }; });
+    results.forEach(r => { const b = getIPOBand(r.ipo); bands[b.label].count++; bands[b.label].rev += r.revenue; });
     return {
       skus: results.length, skusEst: ws.length, tRev,
       avgIPO: results.reduce((s, r) => s + r.ipo, 0) / results.length,
-      avgMg: results.reduce((s, r) => s + r.margin, 0) / results.length,
+      avgMg: tRev > 0 ? results.reduce((s, r) => s + r.revenue * r.margin, 0) / tRev : 0,
       tEst: ws.reduce((s, r) => s + (r.estoque || 0), 0),
       vlP: ws.filter(r => r.tier !== "saudavel").reduce((s, r) => s + (r.estoque || 0) * (r.cost || 0), 0),
       rcP: ws.filter(r => r.pp).reduce((s, r) => s + (r.estoque || 0) * (r.pp || 0), 0),
       p45: tRev > 0 ? results.filter(r => r.ipo >= 45).reduce((s, r) => s + r.revenue, 0) / tRev * 100 : 0,
-      ti, withISBN: results.filter(r => r.isbn).length,
+      ti, tiVal, bands, withISBN: results.filter(r => r.isbn).length,
       lancamentos: results.filter(r => r.isLancamento).length,
       foraLinha: results.filter(r => r.foraLinha).length,
       withCat: results.filter(r => r.familia).length,
@@ -732,16 +752,25 @@ export default function App() {
         {dbg && <div style={{ fontSize: 10, color: "#94A3B8", background: "#F8FAFC", border: "1px solid #F1F5F9", borderRadius: 6, padding: "5px 10px", marginBottom: 10, fontFamily: "monospace" }}>🔍 {dbg}</div>}
 
         {/* KPIs */}
-        {stats && (
+        {stats && (() => {
+          // Guard against corrupted history values
+          const sd = (curr, prevVal, cap) => {
+            if (prev == null || prevVal == null || isNaN(prevVal)) return null;
+            const d = curr - prevVal;
+            if (!isFinite(d) || Math.abs(d) > (cap || 1e12)) return null;
+            return d;
+          };
+          return (
           <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(155px, 1fr))", gap: 8, marginBottom: 16 }}>
-            <KCard l="IPO Médio" v={fmt(stats.avgIPO, 1)} s="de 100" c={getIPOBand(stats.avgIPO).color} d={prev ? r1(stats.avgIPO - prev.avgIPO) : null} />
-            <KCard l="Receita" v={fmtR(stats.tRev)} s={detectedMonths.length + "m"} c="#1D4ED8" d={prev ? Math.round(stats.tRev - prev.tRev) : null} money />
-            <KCard l="Margem Média" v={fmt(stats.avgMg, 1) + "%"} s="portfólio" c="#7C3AED" d={prev ? r1(stats.avgMg - prev.avgMg) : null} sf="pp" />
+            <KCard l="IPO Médio" v={fmt(stats.avgIPO, 1)} s="de 100" c={getIPOBand(stats.avgIPO).color} d={sd(stats.avgIPO, prev?.avgIPO, 100) != null ? r1(sd(stats.avgIPO, prev?.avgIPO, 100)) : null} />
+            <KCard l="Receita" v={fmtR(stats.tRev)} s={detectedMonths.length + "m"} c="#1D4ED8" d={sd(stats.tRev, prev?.tRev) != null ? Math.round(sd(stats.tRev, prev?.tRev)) : null} money />
+            <KCard l="Margem Média" v={fmt(stats.avgMg, 1) + "%"} s="ponderada receita" c="#7C3AED" d={sd(stats.avgMg, prev?.avgMg, 100) != null ? r1(sd(stats.avgMg, prev?.avgMg, 100)) : null} sf="pp" />
             <KCard l="Estoque" v={fmt(stats.tEst)} s={stats.skusEst + " SKUs"} c="#0891B2" />
-            <KCard l="Capital Parado" v={fmtR(stats.vlP)} s=">12m cobertura" c={stats.vlP > 1e6 ? "#DC2626" : "#D97706"} d={prev ? Math.round(stats.vlP - prev.vlP) : null} money inv />
-            <KCard l="Meta ≥45" v={fmt(stats.p45, 1) + "%"} s={stats.p45 >= 75 ? "✓ Atingida" : "⚠ Meta 75%"} c={stats.p45 >= 75 ? "#15803D" : "#D97706"} d={prev ? r1(stats.p45 - prev.p45) : null} sf="pp" />
+            <KCard l="Capital Parado" v={fmtR(stats.vlP)} s=">12m cobertura" c={stats.vlP > 1e6 ? "#DC2626" : "#D97706"} d={sd(stats.vlP, prev?.vlP) != null ? Math.round(sd(stats.vlP, prev?.vlP)) : null} money inv />
+            <KCard l="Meta ≥45" v={fmt(stats.p45, 1) + "%"} s={stats.p45 >= 75 ? "✓ Atingida" : "⚠ Meta 75%"} c={stats.p45 >= 75 ? "#15803D" : "#D97706"} d={sd(stats.p45, prev?.p45, 100) != null ? r1(sd(stats.p45, prev?.p45, 100)) : null} sf="pp" />
           </div>
-        )}
+          );
+        })()}
 
         {/* Tier cards */}
         {stats && stats.skusEst > 0 && (
@@ -759,6 +788,57 @@ export default function App() {
             ))}
           </div>
         )}
+
+        {/* Charts: IPO Distribution + Stock Value by Tier */}
+        {stats && stats.skusEst > 0 && (() => {
+          const total = stats.skus;
+          const bandEntries = Object.entries(stats.bands).filter(([, b]) => b.count > 0);
+          const maxTiVal = Math.max(...Object.values(stats.tiVal), 1);
+          return (
+          <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(300px, 1fr))", gap: 10, marginBottom: 16 }}>
+            {/* IPO Band Distribution */}
+            <div style={{ background: "#FFF", border: "1px solid #E2E8F0", borderRadius: 10, padding: "12px 14px" }}>
+              <div style={{ fontSize: 10, fontWeight: 700, color: "#94A3B8", textTransform: "uppercase", letterSpacing: 0.5, marginBottom: 8 }}>Distribuição IPO (%)</div>
+              {/* Stacked bar */}
+              <div style={{ display: "flex", borderRadius: 6, overflow: "hidden", height: 22, marginBottom: 8 }}>
+                {bandEntries.map(([label, b]) => (
+                  <div key={label} title={`${label}: ${b.count} SKUs (${(b.count/total*100).toFixed(1)}%)`}
+                    style={{ width: (b.count / total * 100) + "%", background: b.color, minWidth: b.count > 0 ? 2 : 0, transition: "width 0.3s" }} />
+                ))}
+              </div>
+              {/* Legend */}
+              <div style={{ display: "flex", flexWrap: "wrap", gap: "4px 12px" }}>
+                {bandEntries.map(([label, b]) => (
+                  <div key={label} style={{ display: "flex", alignItems: "center", gap: 4, fontSize: 11 }}>
+                    <div style={{ width: 8, height: 8, borderRadius: 2, background: b.color, flexShrink: 0 }} />
+                    <span style={{ color: "#64748B", fontWeight: 600 }}>{label}</span>
+                    <span style={{ color: "#94A3B8" }}>{b.count} ({(b.count/total*100).toFixed(0)}%)</span>
+                  </div>
+                ))}
+              </div>
+            </div>
+            {/* Stock Value by Tier */}
+            <div style={{ background: "#FFF", border: "1px solid #E2E8F0", borderRadius: 10, padding: "12px 14px" }}>
+              <div style={{ fontSize: 10, fontWeight: 700, color: "#94A3B8", textTransform: "uppercase", letterSpacing: 0.5, marginBottom: 8 }}>Valor em Estoque por Tier</div>
+              <div style={{ display: "flex", flexDirection: "column", gap: 5 }}>
+                {Object.entries(TIERS).map(([k, t]) => {
+                  const val = stats.tiVal[k] || 0;
+                  const pct = maxTiVal > 0 ? val / maxTiVal * 100 : 0;
+                  return (
+                    <div key={k} style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                      <div style={{ width: 85, fontSize: 10, fontWeight: 600, color: t.color, textAlign: "right", flexShrink: 0 }}>{t.icon} {t.label}</div>
+                      <div style={{ flex: 1, height: 16, background: "#F1F5F9", borderRadius: 4, overflow: "hidden", position: "relative" }}>
+                        <div style={{ width: pct + "%", height: "100%", background: t.color, borderRadius: 4, opacity: 0.75, transition: "width 0.3s" }} />
+                      </div>
+                      <div style={{ width: 90, fontSize: 10, fontWeight: 700, color: "#475569", textAlign: "right", flexShrink: 0 }}>{fmtR(val)}</div>
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+          </div>
+          );
+        })()}
 
         {/* Search & filters */}
         <div style={{ display: "flex", gap: 8, marginBottom: 12, flexWrap: "wrap", alignItems: "center" }}>
@@ -820,7 +900,7 @@ export default function App() {
                   const ti = TIERS[r.tier];
                   const isSel = sel?.code === r.code;
                   return (
-                    <tr key={r.code + i} onClick={() => setSel(isSel ? null : r)}
+                    <tr key={r.code + i} onClick={() => { setSel(isSel ? null : r); setCoverRetry(0); }}
                       style={{
                         cursor: "pointer", transition: "background 0.1s",
                         background: isSel ? "#EFF6FF" : i % 2 ? "#FAFBFC" : "#FFF",
@@ -871,14 +951,16 @@ export default function App() {
           {filtered.length > 300 && <div style={{ padding: 10, textAlign: "center", fontSize: 11, color: "#94A3B8" }}>Mostrando 300 de {filtered.length}. Use filtros para refinar.</div>}
         </div>
 
-        {/* Detail panel */}
+        {/* Detail modal */}
         {sel && (() => {
           const ti = TIERS[sel.tier];
           return (
-            <div style={{ marginTop: 16, background: "#FFF", border: "1px solid #E2E8F0", borderRadius: 14, padding: 20, boxShadow: "0 2px 8px rgba(0,0,0,0.06)" }}>
+            <div onClick={e => { if (e.target === e.currentTarget) setSel(null); }} style={{ position: "fixed", inset: 0, background: "rgba(15,23,42,0.45)", backdropFilter: "blur(4px)", zIndex: 200, display: "flex", alignItems: "center", justifyContent: "center", padding: 20 }}>
+            <div style={{ background: "#FFF", border: "1px solid #E2E8F0", borderRadius: 14, padding: 20, boxShadow: "0 8px 30px rgba(0,0,0,0.18)", width: "100%", maxWidth: 720, maxHeight: "90vh", overflow: "auto", position: "relative" }}>
+              <button onClick={() => setSel(null)} style={{ position: "absolute", top: 10, right: 12, background: "none", border: "none", fontSize: 20, color: "#94A3B8", cursor: "pointer", lineHeight: 1, zIndex: 1 }} title="Fechar">✕</button>
               <div style={{ display: "flex", gap: 20, marginBottom: 16 }}>
                 <div style={{ flexShrink: 0 }}>
-                  <Cover code={sel.code} size={120} />
+                  <Cover code={sel.code} size={120} retrySignal={coverRetry} />
                 </div>
                 <div style={{ flex: 1, minWidth: 0 }}>
                   <h3 style={{ margin: "0 0 4px", fontSize: 16, fontWeight: 700, color: "#1E293B", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
@@ -906,7 +988,7 @@ export default function App() {
                       📷 EAN: <code style={{ background: "#F1F5F9", padding: "1px 4px", borderRadius: 3 }}>{sel.code}</code>
                       {sel.isbn && sel.isbn !== sel.code ? <>{" · "}ISBN: <code style={{ background: "#F1F5F9", padding: "1px 4px", borderRadius: 3 }}>{sel.isbn}</code></> : null}
                       {" · "}
-                      <a href={coverUrl(sel.code)} target="_blank" rel="noreferrer" style={{ color: "#3B82F6" }}>Abrir capa ↗</a>
+                      <a href="#" onClick={e => { e.preventDefault(); delete coverCache[sel.code]; setCoverRetry(c => c + 1); }} style={{ color: "#3B82F6", cursor: "pointer", textDecoration: "none" }}>🔄 Recarregar capa</a>
                     </div>
                   )}
                 </div>
@@ -965,7 +1047,7 @@ export default function App() {
                   { l: "Margem", v: sel.cMg, c: "#7C3AED", bg: "#F5F3FF", tip: "Margem entre preço médio e custo. Quanto maior a diferença, maior a pontuação (até 20)." },
                   { l: "Tendência", v: sel.cTd, c: "#2563EB", bg: "#EFF6FF", tip: sel.isLancamento ? "Lançamento (<6 meses): tendência recebe pontuação neutra de 12/20, pois não há dados suficientes para comparar 3×3 meses." : "Compara a média de vendas dos últimos 3 meses com os 3 meses anteriores. Crescimento ganha mais pontos." },
                   { l: "Preço", v: sel.cPr, c: "#0891B2", bg: "#ECFEFF", sub: sel._priceTier ? sel._priceTier.label : null, tip: "Pontuação por faixa de preço: Econômica (até R$30), Desconto Limitado (R$30–70) ou Catálogo SBB (acima de R$70)." },
-                  { l: "Contribuição", v: sel.cCt, c: "#D97706", bg: "#FFFBEB", tip: "Participação do produto na receita total, normalizada: o maior contribuidor recebe 20 pontos e os demais proporcionalmente." },
+                  { l: "Contribuição", v: sel.cCt, c: "#D97706", bg: "#FFFBEB", tip: "50% participação na receita + 50% participação no volume de vendas, cada um normalizado pelo maior contribuidor (= 20 pontos)." },
                   { l: "Giro", v: sel.cGi, c: "#059669", bg: "#ECFDF5", tip: "Meses de estoque (estoque ÷ venda mensal). Giro rápido (< 3 meses) pontua mais." },
                 ].map(x => (
                   <div key={x.l} style={{ background: x.bg, borderRadius: 8, padding: "8px 6px", textAlign: "center", position: "relative" }}>
@@ -1027,6 +1109,7 @@ export default function App() {
                   </div>
                 </div>
               )}
+            </div>
             </div>
           );
         })()}

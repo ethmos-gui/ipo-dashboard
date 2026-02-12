@@ -354,13 +354,16 @@ const coverCache = {};
 function Cover({ code, size = 36, retrySignal = 0 }) {
   const [src, setSrc] = useState(null);
   const [status, setStatus] = useState("idle");
-  const [visible, setVisible] = useState(false);
+  const [visible, setVisible] = useState(size > 50); // large covers (modal) skip lazy load
   const ref = useRef(null);
   const url = coverUrl(code);
 
-  // Lazy load: only fetch when element is visible
+  // Reset when code changes
+  useEffect(() => { setSrc(null); setStatus("idle"); }, [code]);
+
+  // Lazy load: only for small thumbnails in list
   useEffect(() => {
-    if (!ref.current || !url) return;
+    if (visible || !ref.current || !url) return;
     const obs = new IntersectionObserver(([e]) => { if (e.isIntersecting) { setVisible(true); obs.disconnect(); } }, { rootMargin: "100px" });
     obs.observe(ref.current);
     return () => obs.disconnect();
@@ -368,10 +371,12 @@ function Cover({ code, size = 36, retrySignal = 0 }) {
 
   useEffect(() => {
     if (!visible || !url) return;
-    if (retrySignal === 0 && coverCache[code] === "err") { setStatus("err"); return; }
-    if (retrySignal === 0 && coverCache[code] && coverCache[code] !== "err") { setSrc(coverCache[code]); setStatus("ok"); return; }
-    // Clear cache on retry
-    if (retrySignal > 0) { delete coverCache[code]; }
+    if (retrySignal === 0) {
+      if (coverCache[code] === "err") { setStatus("err"); return; }
+      if (coverCache[code]) { setSrc(coverCache[code]); setStatus("ok"); return; }
+    } else {
+      delete coverCache[code];
+    }
     setStatus("loading");
 
     fetch(url, { referrerPolicy: "no-referrer", mode: "cors" })
@@ -383,8 +388,10 @@ function Cover({ code, size = 36, retrySignal = 0 }) {
         setStatus("ok");
       })
       .catch(() => {
-        coverCache[code] = "err";
-        setStatus("err");
+        // Fallback: use direct URL as img src (works when CORS blocks fetch but not img)
+        coverCache[code] = url;
+        setSrc(url);
+        setStatus("direct");
       });
   }, [visible, url, code, retrySignal]);
 

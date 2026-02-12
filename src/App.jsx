@@ -1,5 +1,6 @@
 import { useState, useMemo, useCallback, useRef, useEffect } from "react";
 import Papa from "papaparse";
+import * as XLSX from "xlsx";
 
 // ─── COVER IMAGE API ─────────────────────────────────
 const COVER_BASE = "https://api.metabooks.com/api/v1/cover/";
@@ -46,8 +47,8 @@ const r1 = (n) => Math.round(n * 10) / 10;
 // ─── PRICE TIERS (auto-detected) ─────────────────────
 const PRICE_TIERS = [
   { id: "economica", label: "Econômica", maxNormalDisc: 15, maxPromoDisc: 20, color: "#0891B2", bg: "#ECFEFF" },
-  { id: "intermediaria", label: "Intermediária", maxNormalDisc: 40, maxPromoDisc: 45, color: "#7C3AED", bg: "#F5F3FF" },
-  { id: "premium", label: "Premium", maxNormalDisc: 58, maxPromoDisc: 65, color: "#B45309", bg: "#FFFBEB" },
+  { id: "intermediaria", label: "Desconto Limitado", maxNormalDisc: 40, maxPromoDisc: 45, color: "#7C3AED", bg: "#F5F3FF" },
+  { id: "premium", label: "Catálogo SBB", maxNormalDisc: 58, maxPromoDisc: 65, color: "#B45309", bg: "#FFFBEB" },
 ];
 
 function detectPriceTier(discPct) {
@@ -56,11 +57,51 @@ function detectPriceTier(discPct) {
   return PRICE_TIERS[2]; // premium
 }
 
+// ─── CATALOG PARSER ──────────────────────────────────
+function parseCatalog(rows) {
+  if (!rows.length) return {};
+  const h = Object.keys(rows[0]);
+  const cC = findCol(h, ["codigo", "código", "sku", "code"]) || h[0];
+  const cFam = findCol(h, ["familia de demanda", "família de demanda", "familia", "família"]);
+  const cTrad = findCol(h, ["traducao", "tradução", "traduc"]);
+  const cFL = findCol(h, ["fora de linha", "fora_de_linha", "status"]);
+  const cDate = findCol(h, ["data da primeira venda", "data primeira venda", "primeira venda", "dt_primeira"]);
+  const map = {};
+  for (const row of rows) {
+    const code = String(row[cC] || "").trim();
+    if (!code) continue;
+    let dtPrim = null;
+    if (cDate && row[cDate]) {
+      const raw = row[cDate];
+      if (raw instanceof Date || (typeof raw === "object" && raw)) {
+        dtPrim = new Date(raw);
+      } else if (typeof raw === "number") {
+        // Excel serial date
+        dtPrim = new Date((raw - 25569) * 86400000);
+      } else {
+        const parsed = Date.parse(String(raw));
+        if (!isNaN(parsed)) dtPrim = new Date(parsed);
+      }
+    }
+    map[code] = {
+      familia: cFam ? String(row[cFam] || "").trim() : "",
+      traducao: cTrad ? String(row[cTrad] || "").trim() : "",
+      foraLinha: cFL ? String(row[cFL] || "").toLowerCase().includes("fora") : false,
+      dtPrimeiraVenda: dtPrim,
+    };
+  }
+  return map;
+}
+
 // ─── IPO ENGINE ──────────────────────────────────────
-function calcIPO(item, totalRev) {
+function calcIPO(item, totalRev, maxRevShare) {
   const cMg = (Math.max(0, Math.min(100, item.margin || 0)) / 100) * 20;
+  
+  // Trend: protect launches (< 6 months since first sale) — give neutral 12/20
   let cTd = 10;
-  if (item.qtyP1 > 0 && item.qtyP2 != null) {
+  if (item.isLancamento) {
+    cTd = 12; // slight positive bias for new products
+  } else if (item.qtyP1 > 0 && item.qtyP2 != null) {
     cTd = Math.max(0, Math.min(20, ((((item.qtyP2 - item.qtyP1) / item.qtyP1) * 100 + 50) / 100) * 20));
   }
 
@@ -82,7 +123,9 @@ function calcIPO(item, totalRev) {
     item._discPct = r1(discPct);
   }
 
-  const cCt = Math.min(20, Math.log(1 + (totalRev > 0 ? (item.revenue / totalRev) * 100 : 0)) * 7);
+  // Contribution: normalized so top contributor = 20
+  const revShare = totalRev > 0 ? item.revenue / totalRev : 0;
+  const cCt = maxRevShare > 0 ? Math.min(20, (revShare / maxRevShare) * 20) : 0;
   let cGi = 10;
   if (item.mesesEst != null) {
     cGi = item.mesesEst <= 3 ? 20 : item.mesesEst >= 24 ? 0 : 20 - ((item.mesesEst - 3) / 21) * 20;
@@ -219,16 +262,15 @@ function parseSales(rows) {
   const allMonths = [...allMonthsSet].sort();
   const nMonths = allMonths.length || 12;
 
-  // Calculate trend: compare avg of last half vs first half
-  const half = Math.max(1, Math.floor(allMonths.length / 2));
-  const firstHalf = allMonths.slice(0, half);
-  const secondHalf = allMonths.slice(-half);
+  // Calculate trend: last 3 months vs previous 3 months
+  const last3 = allMonths.slice(-3);
+  const prev3 = allMonths.slice(-6, -3);
 
   const items = Object.values(map).map((it) => {
     const series = allMonths.map(m => it.monthly[m] || 0);
-    // Trend: avg qty second half vs first half
-    const avgP1 = firstHalf.reduce((s, m) => s + (it.monthly[m] || 0), 0) / firstHalf.length;
-    const avgP2 = secondHalf.reduce((s, m) => s + (it.monthly[m] || 0), 0) / secondHalf.length;
+    // Trend: avg qty last 3 months vs previous 3 months
+    const avgP1 = prev3.length > 0 ? prev3.reduce((s, m) => s + (it.monthly[m] || 0), 0) / prev3.length : 0;
+    const avgP2 = last3.length > 0 ? last3.reduce((s, m) => s + (it.monthly[m] || 0), 0) / last3.length : 0;
 
     return {
       code: it.code, desc: it.desc, qty: it.qty, revenue: it.revenue, ean: it.ean || "", isbn: it.isbn || "",
@@ -247,16 +289,15 @@ function parseSales(rows) {
 function parseStock(rows) {
   if (!rows.length) return { byCode: {} };
   const h = Object.keys(rows[0]);
-  const cC = findCol(h, ["n item", "codigo", "code", "item", "sku"]) || h[0];
-  const cQ = findCol(h, ["quantidade disponivel", "disponivel", "estoque", "stock", "saldo"]);
+  const cC = findCol(h, ["sku", "n item", "codigo", "code", "item"]) || h[0];
+  const cQ = findCol(h, ["total estoque", "quantidade disponivel", "disponivel", "estoque", "saldo final", "stock", "saldo"]);
   const cD = findCol(h, ["descricao", "descri", "produto"]);
   const map = {};
   for (const row of rows) {
     const code = String(row[cC] || "").trim();
-    if (!code) continue;
+    if (!code || code === "Total" || /^\d+\.\d+E\+/.test(code)) continue;
     const qty = toNum(row[cQ]);
     const desc = cD ? String(row[cD] || "") : "";
-    // Aggregate stock by code (sum quantities if multiple rows per product)
     if (!map[code]) map[code] = { estoque: 0, descStock: desc };
     map[code].estoque += qty;
     if (!map[code].descStock && desc) map[code].descStock = desc;
@@ -362,8 +403,10 @@ export default function App() {
   const [step, setStep] = useState("upload");
   const [salesRaw, setSalesRaw] = useState(null);
   const [stockRaw, setStockRaw] = useState(null);
+  const [catalogRaw, setCatalogRaw] = useState(null);
   const [salesFn, setSalesFn] = useState("");
   const [stockFn, setStockFn] = useState("");
+  const [catalogFn, setCatalogFn] = useState("");
   const [monthsBack, setMonthsBack] = useState(0); // 0 = all
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState(null);
@@ -372,6 +415,9 @@ export default function App() {
   const [fTier, setFTier] = useState("all");
   const [fBand, setFBand] = useState("all");
   const [fPriceTier, setFPriceTier] = useState("all");
+  const [fFamilia, setFFamilia] = useState("all");
+  const [fTraducao, setFTraducao] = useState("all");
+  const [fStatus, setFStatus] = useState("all");
   const [search, setSearch] = useState("");
   const [sel, setSel] = useState(null);
   const [hist, setHist] = useState([]);
@@ -389,11 +435,49 @@ export default function App() {
     Papa.parse(file, { header: true, skipEmptyLines: true, complete: (r) => res(r.data), error: rej });
   }), []);
 
+  const readXLSX = useCallback((file) => new Promise((res, rej) => {
+    const reader = new FileReader();
+    reader.onload = (e) => {
+      try {
+        const wb = XLSX.read(e.target.result, { type: "array" });
+        const ws = wb.Sheets[wb.SheetNames[0]];
+        // Find header row: look for a row containing "SKU" or known column names
+        const range = XLSX.utils.decode_range(ws["!ref"] || "A1");
+        let headerRow = 0;
+        for (let r = range.s.r; r <= Math.min(range.e.r, 50); r++) {
+          for (let c = range.s.c; c <= range.e.c; c++) {
+            const cell = ws[XLSX.utils.encode_cell({ r, c })];
+            const v = String(cell?.v || "").trim().toLowerCase();
+            if (v === "sku" || v === "codigo" || v === "código" || v === "n item" || v === "nº item") {
+              headerRow = r;
+              break;
+            }
+          }
+          if (headerRow > 0) break;
+        }
+        const rows = XLSX.utils.sheet_to_json(ws, { range: headerRow, defval: "" });
+        // Filter out empty/total rows
+        const filtered = rows.filter(r => {
+          const vals = Object.values(r);
+          return vals.some(v => v !== "" && v !== null && v !== undefined);
+        });
+        res(filtered);
+      } catch (err) { rej(err); }
+    };
+    reader.onerror = () => rej(new Error("Erro ao ler arquivo"));
+    reader.readAsArrayBuffer(file);
+  }), []);
+
   const onFile = useCallback(async (file, setData, setName) => {
     if (!file) return;
     setName(file.name);
-    try { setData(await readCSV(file)); setError(null); } catch (e) { setError("Erro: " + e.message); }
-  }, [readCSV]);
+    try {
+      const isExcel = /\.xlsx?$/i.test(file.name);
+      const data = isExcel ? await readXLSX(file) : await readCSV(file);
+      setData(data);
+      setError(null);
+    } catch (e) { setError("Erro: " + e.message); }
+  }, [readCSV, readXLSX]);
 
   const go = useCallback(() => {
     if (!salesRaw?.length) { setError("Envie o relatório de vendas."); return; }
@@ -424,15 +508,26 @@ export default function App() {
 
     const { items: sales, allMonths: months } = parseSales(filteredRows);
     const { byCode: stock } = stockRaw ? parseStock(stockRaw) : { byCode: {} };
+    const catalog = catalogRaw ? parseCatalog(catalogRaw) : {};
+    const now = new Date();
     const totalRev = sales.reduce((s, i) => s + i.revenue, 0);
+    const maxRevShare = totalRev > 0 ? Math.max(...sales.map(i => i.revenue / totalRev)) : 0;
     const items = sales.map((item) => {
-      // Direct match: Código (vendas) = Nº Item (estoque)
       const si = stock[item.code] || null;
       const estoque = si?.estoque ?? null;
       const mesesEst = estoque != null && item.vdaMes > 0 ? estoque / item.vdaMes : estoque > 0 ? 999 : null;
       const isbn = item.isbn || extractISBN(item.code) || extractISBN(item.ean) || "";
-      const e = { ...item, estoque, mesesEst, descStock: si?.descStock || "", isbn };
-      const ipo = calcIPO(e, totalRev);
+      // Catalog enrichment
+      const cat = catalog[item.code] || {};
+      const familia = cat.familia || "";
+      const traducao = cat.traducao || "";
+      const foraLinha = cat.foraLinha || false;
+      const dtPrimeiraVenda = cat.dtPrimeiraVenda || null;
+      // Launch detection: < 6 months since first sale
+      const mesesDesde = dtPrimeiraVenda ? Math.max(0, (now.getFullYear() - dtPrimeiraVenda.getFullYear()) * 12 + now.getMonth() - dtPrimeiraVenda.getMonth()) : null;
+      const isLancamento = mesesDesde !== null && mesesDesde < 6;
+      const e = { ...item, estoque, mesesEst, descStock: si?.descStock || "", isbn, familia, traducao, foraLinha, dtPrimeiraVenda, mesesDesde, isLancamento };
+      const ipo = calcIPO(e, totalRev, maxRevShare);
       const tier = estoque != null ? getTier({ ...e, mesesEst }) : "saudavel";
       const pp = tier !== "saudavel" ? getPromoPrice(e, tier) : null;
       const pm = pp && pp > 0 ? ((pp - e.cost) / pp) * 100 : null;
@@ -441,7 +536,7 @@ export default function App() {
     });
 
     return { results: items, detectedMonths: months, totalMonths };
-  }, [salesRaw, stockRaw, monthsBack]);
+  }, [salesRaw, stockRaw, catalogRaw, monthsBack]);
 
   useEffect(() => {
     if (!detectedMonths.length) return;
@@ -449,7 +544,10 @@ export default function App() {
     const withISBN = results.filter(i => i.isbn).length;
     const withCover = results.filter(i => coverUrl(i.code)).length;
     const withStock = results.filter(i => i.estoque != null).length;
-    setDbg(`${m.length}/${totalMonths} meses (${mesAnoLabel(m[0])}→${mesAnoLabel(m[m.length-1])}) | ${withStock}/${results.length} com estoque | ${withCover} com capa`);
+    const withCat = results.filter(i => i.familia).length;
+    const launches = results.filter(i => i.isLancamento).length;
+    const foraCount = results.filter(i => i.foraLinha).length;
+    setDbg(`${m.length}/${totalMonths} meses (${mesAnoLabel(m[0])}→${mesAnoLabel(m[m.length-1])}) | ${withStock}/${results.length} com estoque | ${withCat} com catálogo${launches ? ` | ${launches} lançamentos` : ""}${foraCount ? ` | ${foraCount} fora de linha` : ""} | ${withCover} com capa`);
   }, [detectedMonths, results, totalMonths]);
 
   const filtered = useMemo(() => {
@@ -457,9 +555,16 @@ export default function App() {
     if (fTier !== "all") l = l.filter(r => r.tier === fTier);
     if (fBand !== "all") l = l.filter(r => r.band.label === fBand);
     if (fPriceTier !== "all") l = l.filter(r => r._priceTier?.id === fPriceTier);
-    if (search) { const t = search.toLowerCase(); l = l.filter(r => r.code.toLowerCase().includes(t) || r.desc.toLowerCase().includes(t) || (r.descStock || "").toLowerCase().includes(t) || (r.isbn || "").includes(t)); }
+    if (fFamilia !== "all") l = l.filter(r => r.familia === fFamilia);
+    if (fTraducao !== "all") l = l.filter(r => r.traducao === fTraducao);
+    if (fStatus !== "all") {
+      if (fStatus === "lancamento") l = l.filter(r => r.isLancamento);
+      else if (fStatus === "fora") l = l.filter(r => r.foraLinha);
+      else if (fStatus === "linha") l = l.filter(r => !r.foraLinha);
+    }
+    if (search) { const t = search.toLowerCase(); l = l.filter(r => r.code.toLowerCase().includes(t) || r.desc.toLowerCase().includes(t) || (r.descStock || "").toLowerCase().includes(t) || (r.isbn || "").includes(t) || (r.familia || "").toLowerCase().includes(t) || (r.traducao || "").toLowerCase().includes(t)); }
     return [...l].sort((a, b) => sortDir === "desc" ? (b[sortKey] ?? -1e9) - (a[sortKey] ?? -1e9) : (a[sortKey] ?? 1e9) - (b[sortKey] ?? 1e9));
-  }, [results, fTier, fBand, fPriceTier, search, sortKey, sortDir]);
+  }, [results, fTier, fBand, fPriceTier, fFamilia, fTraducao, fStatus, search, sortKey, sortDir]);
 
   const stats = useMemo(() => {
     if (!results.length) return null;
@@ -476,6 +581,9 @@ export default function App() {
       rcP: ws.filter(r => r.pp).reduce((s, r) => s + (r.estoque || 0) * (r.pp || 0), 0),
       p45: tRev > 0 ? results.filter(r => r.ipo >= 45).reduce((s, r) => s + r.revenue, 0) / tRev * 100 : 0,
       ti, withISBN: results.filter(r => r.isbn).length,
+      lancamentos: results.filter(r => r.isLancamento).length,
+      foraLinha: results.filter(r => r.foraLinha).length,
+      withCat: results.filter(r => r.familia).length,
     };
   }, [results]);
 
@@ -496,6 +604,8 @@ export default function App() {
       PrecoLista: r1(r.listPrice), Custo: r1(r.cost), Quantidade: r.qty, Receita: Math.round(r.revenue),
       Estoque: r.estoque ?? "", MesesEstoque: r.mesesEst != null ? (r.mesesEst >= 900 ? "999" : Math.round(r.mesesEst)) : "",
       Tendencia: r.trend ?? "", PrecoPromo: r.pp ?? "", MargemPromo: r.pm ?? "",
+      Familia: r.familia || "", Traducao: r.traducao || "", ForaDeLinha: r.foraLinha ? "Sim" : "", Lancamento: r.isLancamento ? "Sim" : "",
+      PrimeiraVenda: r.dtPrimeiraVenda ? r.dtPrimeiraVenda.toLocaleDateString("pt-BR") : "", MesesDesdeLanc: r.mesesDesde ?? "",
     })), { delimiter: ";" });
     const b = new Blob(["\uFEFF" + csv], { type: "text/csv;charset=utf-8;" });
     const u = URL.createObjectURL(b);
@@ -516,7 +626,12 @@ export default function App() {
               <span style={{ fontSize: 10, fontWeight: 700, letterSpacing: 1.5, color: "#1D4ED8" }}>SBB — ÍNDICE DE PERFORMANCE DE OFERTA</span>
             </div>
             <h1 style={U.h1}>IPO Dashboard</h1>
-            <p style={{ fontSize: 13, color: "#64748B", margin: 0 }}>Suba seus CSVs, receba análise automática com sugestões de promoção e capas dos produtos</p>
+            <p style={{ fontSize: 13, color: "#64748B", margin: 0 }}>Análise automática de catálogo com sugestões de promoção e capas dos produtos</p>
+          </div>
+
+          <div style={{ background: "#EFF6FF", border: "1px solid #BFDBFE", borderRadius: 10, padding: "14px 16px", marginBottom: 16, fontSize: 12, color: "#1E40AF", lineHeight: 1.6 }}>
+            <div style={{ fontWeight: 700, marginBottom: 4, fontSize: 13 }}>ℹ️ O que é o IPO?</div>
+            O <b>Índice de Performance de Oferta</b> pontua cada produto de 0 a 100 com base em 5 critérios: Margem, Tendência de vendas, Faixa de preço, Contribuição na receita e Giro de estoque. Cada critério vale até 20 pontos. Com o arquivo de catálogo, o sistema identifica <b>lançamentos</b> ({"<"}6 meses), <b>família de demanda</b>, <b>tradução</b> e produtos <b>fora de linha</b>, ajustando a análise e habilitando filtros adicionais.
           </div>
 
           <div style={{ ...U.card, display: "flex", alignItems: "center", gap: 10 }}>
@@ -529,8 +644,11 @@ export default function App() {
             hint="CSV com: Código, Descrição, Qtd, Preço Médio, Preço Lista, Custo, Mes/Ano (MAAAA)."
             onFile={f => onFile(f, setSalesRaw, setSalesFn)} />
           <FileBox label="Posição de Estoque" tag="Recomendado" color="#059669" name={stockFn}
-            hint="CSV: Código, 3º Nº de Item (ISBN), Qtd Disponível, Descrição."
+            hint="Excel ou CSV com: SKU (EAN), Total Estoque. Aceita .xlsx e .csv."
             onFile={f => onFile(f, setStockRaw, setStockFn)} />
+          <FileBox label="Catálogo de Produtos" tag="Recomendado" color="#7C3AED" name={catalogFn}
+            hint="Excel com: Código, Família de demanda, Tradução, Fora de linha, Data da primeira venda."
+            onFile={f => onFile(f, setCatalogRaw, setCatalogFn)} />
 
           <div style={U.card}>
             <div style={U.lbl}>Período de análise</div>
@@ -657,6 +775,26 @@ export default function App() {
             <option value="all">Todas as categorias</option>
             {PRICE_TIERS.map(t => <option key={t.id} value={t.id}>{t.label} (até {t.maxNormalDisc}%)</option>)}
           </select>
+          {results.some(r => r.familia) && (
+            <select value={fFamilia} onChange={e => setFFamilia(e.target.value)} style={{ padding: "9px 12px", borderRadius: 8, fontSize: 13, background: "#FFF", border: "1px solid #E2E8F0", color: "#334155", cursor: "pointer" }}>
+              <option value="all">Todas as famílias</option>
+              {[...new Set(results.map(r => r.familia).filter(Boolean))].sort().map(f => <option key={f} value={f}>{f}</option>)}
+            </select>
+          )}
+          {results.some(r => r.traducao) && (
+            <select value={fTraducao} onChange={e => setFTraducao(e.target.value)} style={{ padding: "9px 12px", borderRadius: 8, fontSize: 13, background: "#FFF", border: "1px solid #E2E8F0", color: "#334155", cursor: "pointer" }}>
+              <option value="all">Todas as traduções</option>
+              {[...new Set(results.map(r => r.traducao).filter(Boolean))].sort().map(t => <option key={t} value={t}>{t}</option>)}
+            </select>
+          )}
+          {results.some(r => r.foraLinha || r.isLancamento) && (
+            <select value={fStatus} onChange={e => setFStatus(e.target.value)} style={{ padding: "9px 12px", borderRadius: 8, fontSize: 13, background: "#FFF", border: "1px solid #E2E8F0", color: "#334155", cursor: "pointer" }}>
+              <option value="all">Todos os status</option>
+              <option value="linha">Produto de linha</option>
+              <option value="fora">Fora de linha</option>
+              <option value="lancamento">Lançamentos ({"<"}6m)</option>
+            </select>
+          )}
           <span style={{ fontSize: 12, color: "#94A3B8", fontWeight: 600 }}>{filtered.length} itens</span>
         </div>
 
@@ -713,11 +851,15 @@ export default function App() {
                         {r.mesesEst == null ? "–" : r.mesesEst >= 900 ? "∞" : fmt(r.mesesEst)}
                       </td>
                       <td style={P.td}>
+                        <div style={{ display: "flex", gap: 3, flexWrap: "wrap", alignItems: "center" }}>
                         {ti && r.tier !== "saudavel" && (
                           <span style={{ fontSize: 10, padding: "2px 6px", borderRadius: 4, background: ti.bg, color: ti.color, fontWeight: 600, whiteSpace: "nowrap", border: "1px solid " + ti.ring }}>
                             {ti.icon} {ti.label}
                           </span>
                         )}
+                        {r.isLancamento && <span style={{ fontSize: 8, padding: "1px 4px", borderRadius: 3, background: "#DBEAFE", color: "#1D4ED8", fontWeight: 700 }}>🚀</span>}
+                        {r.foraLinha && <span style={{ fontSize: 8, padding: "1px 4px", borderRadius: 3, background: "#FEE2E2", color: "#DC2626", fontWeight: 700 }}>⊘</span>}
+                        </div>
                       </td>
                       <td style={{ ...P.td, color: "#B45309", fontWeight: 700 }}>{r.pp ? fmtR(r.pp) : ""}</td>
                     </tr>
@@ -749,7 +891,16 @@ export default function App() {
                       IPO {fmt(sel.ipo, 1)}
                     </span>
                     <span style={{ fontSize: 12, color: sel.band.color, fontWeight: 600 }}>{sel.band.label}</span>
+                    {sel.isLancamento && <span style={{ padding: "2px 7px", borderRadius: 5, fontSize: 10, fontWeight: 700, background: "#DBEAFE", color: "#1D4ED8", border: "1px solid #93C5FD" }}>🚀 Lançamento</span>}
+                    {sel.foraLinha && <span style={{ padding: "2px 7px", borderRadius: 5, fontSize: 10, fontWeight: 700, background: "#FEE2E2", color: "#DC2626", border: "1px solid #FECACA" }}>⊘ Fora de linha</span>}
                   </div>
+                  {(sel.familia || sel.traducao || sel.dtPrimeiraVenda) && (
+                    <div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginTop: 5 }}>
+                      {sel.familia && <span style={{ fontSize: 10, padding: "2px 6px", borderRadius: 4, background: "#F5F3FF", color: "#7C3AED", fontWeight: 600, border: "1px solid #DDD6FE" }}>{sel.familia}</span>}
+                      {sel.traducao && <span style={{ fontSize: 10, padding: "2px 6px", borderRadius: 4, background: "#FFF7ED", color: "#C2410C", fontWeight: 600, border: "1px solid #FED7AA" }}>{sel.traducao}</span>}
+                      {sel.dtPrimeiraVenda && <span style={{ fontSize: 10, color: "#94A3B8" }}>1ª venda: {sel.dtPrimeiraVenda.toLocaleDateString("pt-BR")}{sel.mesesDesde != null ? ` (${sel.mesesDesde} meses)` : ""}</span>}
+                    </div>
+                  )}
                   {coverUrl(sel.code) && (
                     <div style={{ marginTop: 6, fontSize: 10, color: "#94A3B8" }}>
                       📷 EAN: <code style={{ background: "#F1F5F9", padding: "1px 4px", borderRadius: 3 }}>{sel.code}</code>
@@ -761,16 +912,15 @@ export default function App() {
                 </div>
               </div>
 
-              {/* Monthly performance sparkline */}
+              {/* Monthly performance bar chart */}
               {sel.series && sel.series.length > 1 && (() => {
-                const W = 540, H = 100, PAD = { t: 4, b: 18, l: 36, r: 8 };
+                const W = 600, H = 110, PAD = { t: 4, b: 18, l: 36, r: 8 };
                 const cw = W - PAD.l - PAD.r, ch = H - PAD.t - PAD.b;
                 const max = Math.max(...sel.series, 1);
                 const barW = Math.max(2, (cw / sel.series.length) - 2);
                 const avgFirst = sel.series.slice(0, Math.ceil(sel.series.length / 2)).reduce((a, b) => a + b, 0) / Math.ceil(sel.series.length / 2);
                 const avgSecond = sel.series.slice(-Math.ceil(sel.series.length / 2)).reduce((a, b) => a + b, 0) / Math.ceil(sel.series.length / 2);
                 const trendColor = avgSecond >= avgFirst ? "#16A34A" : "#DC2626";
-                // Y-axis ticks
                 const ySteps = [0, Math.round(max / 2), Math.round(max)];
                 return (
                   <div style={{ background: "#F8FAFC", borderRadius: 10, padding: "12px 16px", marginBottom: 16, border: "1px solid #E2E8F0" }}>
@@ -780,7 +930,7 @@ export default function App() {
                         {sel.trend >= 0 ? "▲" : "▼"} {Math.abs(sel.trend).toFixed(1)}% tendência
                       </span>
                     </div>
-                    <svg width={W} height={H} style={{ display: "block" }}>
+                    <svg viewBox={`0 0 ${W} ${H}`} preserveAspectRatio="xMidYMid meet" style={{ display: "block", width: "100%", height: "auto" }}>
                       {/* Grid lines */}
                       {ySteps.map(v => {
                         const y = PAD.t + ch - (v / max) * ch;
@@ -812,14 +962,17 @@ export default function App() {
 
               <div style={{ display: "grid", gridTemplateColumns: "repeat(5, 1fr)", gap: 6, marginBottom: 16 }}>
                 {[
-                  { l: "Margem", v: sel.cMg, c: "#7C3AED", bg: "#F5F3FF" },
-                  { l: "Tendência", v: sel.cTd, c: "#2563EB", bg: "#EFF6FF" },
-                  { l: "Preço", v: sel.cPr, c: "#0891B2", bg: "#ECFEFF", sub: sel._priceTier ? sel._priceTier.label : null },
-                  { l: "Contribuição", v: sel.cCt, c: "#D97706", bg: "#FFFBEB" },
-                  { l: "Giro", v: sel.cGi, c: "#059669", bg: "#ECFDF5" },
+                  { l: "Margem", v: sel.cMg, c: "#7C3AED", bg: "#F5F3FF", tip: "Margem entre preço médio e custo. Quanto maior a diferença, maior a pontuação (até 20)." },
+                  { l: "Tendência", v: sel.cTd, c: "#2563EB", bg: "#EFF6FF", tip: sel.isLancamento ? "Lançamento (<6 meses): tendência recebe pontuação neutra de 12/20, pois não há dados suficientes para comparar 3×3 meses." : "Compara a média de vendas dos últimos 3 meses com os 3 meses anteriores. Crescimento ganha mais pontos." },
+                  { l: "Preço", v: sel.cPr, c: "#0891B2", bg: "#ECFEFF", sub: sel._priceTier ? sel._priceTier.label : null, tip: "Pontuação por faixa de preço: Econômica (até R$30), Desconto Limitado (R$30–70) ou Catálogo SBB (acima de R$70)." },
+                  { l: "Contribuição", v: sel.cCt, c: "#D97706", bg: "#FFFBEB", tip: "Participação do produto na receita total, normalizada: o maior contribuidor recebe 20 pontos e os demais proporcionalmente." },
+                  { l: "Giro", v: sel.cGi, c: "#059669", bg: "#ECFDF5", tip: "Meses de estoque (estoque ÷ venda mensal). Giro rápido (< 3 meses) pontua mais." },
                 ].map(x => (
-                  <div key={x.l} style={{ background: x.bg, borderRadius: 8, padding: "8px 6px", textAlign: "center" }}>
-                    <div style={{ fontSize: 10, color: "#64748B", fontWeight: 600 }}>{x.l}</div>
+                  <div key={x.l} style={{ background: x.bg, borderRadius: 8, padding: "8px 6px", textAlign: "center", position: "relative" }}>
+                    <div style={{ fontSize: 10, color: "#64748B", fontWeight: 600, display: "flex", alignItems: "center", justifyContent: "center", gap: 3 }}>
+                      {x.l}
+                      <span title={x.tip} style={{ display: "inline-flex", alignItems: "center", justifyContent: "center", width: 13, height: 13, borderRadius: "50%", background: "#E2E8F0", color: "#94A3B8", fontSize: 8, fontWeight: 800, cursor: "help", lineHeight: 1 }}>?</span>
+                    </div>
                     <div style={{ fontSize: 18, fontWeight: 800, color: x.c }}>{x.v}</div>
                     <div style={{ height: 4, background: "#E2E8F0", borderRadius: 2, marginTop: 5, overflow: "hidden" }}>
                       <div style={{ height: "100%", width: (x.v / 20 * 100) + "%", background: x.c, borderRadius: 2, transition: "width 0.4s" }} />
@@ -895,7 +1048,7 @@ function FileBox({ label, tag, color, name, hint, onFile }) {
         border: name ? "2px solid " + color : drag ? "2px dashed " + color : "1.5px dashed #CBD5E1",
         borderRadius: 10, padding: "13px 14px", marginBottom: 8, cursor: "pointer", transition: "all 0.15s",
       }}>
-      <input ref={ref} type="file" accept=".csv,.txt,.tsv" onChange={e => { if (e.target.files[0]) onFile(e.target.files[0]); }} style={{ display: "none" }} />
+      <input ref={ref} type="file" accept=".csv,.txt,.tsv,.xlsx,.xls" onChange={e => { if (e.target.files[0]) onFile(e.target.files[0]); }} style={{ display: "none" }} />
       <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
         <div style={{ width: 36, height: 36, borderRadius: 8, display: "flex", alignItems: "center", justifyContent: "center", background: name ? color + "15" : "#F8FAFC", fontSize: 16, border: "1px solid " + (name ? color + "33" : "#E2E8F0") }}>
           {name ? "✓" : "📁"}
@@ -921,9 +1074,9 @@ function SmallFile({ label, name, n, onFile }) {
         padding: "6px 10px", borderRadius: 6, background: "#FFF", border: "1px solid #E2E8F0",
         color: name ? "#059669" : "#94A3B8", fontSize: 11, cursor: "pointer", fontWeight: 600,
       }}>
-        {name ? "✓ " + n + " linhas" : "Escolher CSV..."}
+        {name ? "✓ " + n + " linhas" : "Escolher arquivo..."}
       </button>
-      <input ref={ref} type="file" accept=".csv,.txt" onChange={e => { if (e.target.files[0]) onFile(e.target.files[0]); }} style={{ display: "none" }} />
+      <input ref={ref} type="file" accept=".csv,.txt,.xlsx,.xls" onChange={e => { if (e.target.files[0]) onFile(e.target.files[0]); }} style={{ display: "none" }} />
     </div>
   );
 }
